@@ -1,0 +1,326 @@
+---
+title: "Аудитории городских проектов: case Челябинск"
+author: "Ilya Starikov"
+date: "22 сентября 2017 г"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval=FALSE, fig.width = 5, fig.height = 5)
+
+```
+```{r}
+library(RCurl) # Библиотека для генерации запросов к API
+library(jsonlite) # Библиотека для обработки JSON
+library(igraph) # Библиотека для создание данных для построения графа
+library(dplyr) # Библиотека для предобработки
+library(tidyr) # Библиотека для предобработки
+library(stringr) # Библиотека для работы со текстовыми данными
+library(ggplot2) # Библиотека для визуализации
+library(curl)
+library(microbenchmark) # Библиотека для отслеживания времени исполнений кода
+```
+
+Мы используем `r R.Version()$version.string`)
+
+Содержание:
+
+1. Библиотеки 
+2. Загрузка файла с БД проектов и предобработка
+3. Выгрузка данных из ВК
+    + функции для выгрузки
+    + многопоточность
+4. Создание файла для сетевого анализа
+    + Матрица пересечений аудиторий
+    + Применением меры сходства Жаккара
+    + Применением собственной меры сходства
+    + Созданием файла с данными для сетевого анализа (узлы ребра)
+
+# 1 Библиотеки
+
+`library("RCurl") # Библиотека для генерации запросов к API`
+`library("jsonlite") # Библиотека для обработки JSON`
+`library(igraph) # Библиотека для создание файла для построения графа`
+`library(dplyr) # Библиотека для предобработки`
+`library(tidyr) # Библиотека для предобработки`
+`library(stringr) # Библиотека для работы со текстовыми данными`
+`library(ggplot2) # Библиотека для визуализации`
+`library(microbenchmark) # Библиотека для отслеживания времени исполнений кода`
+
+# 2 Загрузка файла с БД проектов и предобработка
+
+## 2.1 Загрузка файла
+
+Мы составляли БД в *Google Disc* и потом сохраняли его на компьютере с расширением *.csv*
+
+Далее загружаем файл в окружение с помощтю функции `read.cvs()` (рекомендуем установить параметр `stringsAsFactors = FALSE`)
+
+```{r, include=FALSE, eval= TRUE}
+# загрузка окружения
+load("D:/2017/R net analysis/Челябинск/che74.RData")
+```
+
+```{r}
+gr_che <- read.csv("Челябинск/Паблики Челябинск.csv", sep = ";", stringsAsFactors = F)
+```
+
+Преобразуем данные для дальнейшей обработки.
+
+В первую очередь сохраняем адреса групп в ВК в том формате, который будет пригоден для автоматического составления запроса.
+
+Для этого нужно оставить только id группы. Причем если в id группы были сформированны автоматически, они имеют вид *"club11001100"*, в таком случае нам необходимо оставить только цифры, а слово *"club"* удалит. Если же имя группы изменено ее владельцами и содержит слово *"club"*, например, *"club_super"*, тогда id группы будет считаться полностью *"club_super"*. 
+Такие же манипуляции проделываем и с группами типа *public* и *event*.
+```{r}
+gr_che$url_VK <- gsub("http://vk.com/", "", gr_che$url_VK)
+gr_che$url_VK <- gsub("https://vk.com/", "", gr_che$url_VK)
+gr_che$url_VK <- str_trim(gr_che$url_VK)
+
+x_club <- grep("club", gr_che$url_VK)
+# проверяем какие из id следует преобразовать, а какие нет
+gr_che$url_VK[x_club]
+# оставляем только те id, которые следует преобразовать
+x_club <- x_club[-13]
+# теперь удаляем ненужные слова club
+gr_che$url_VK[x_club] <- gsub("club", "", gr_che$url_VK[x_club])
+
+x_club <- grep("event", gr_che$url_VK)
+gr_che$url_VK[x_club] <- gsub("event", "", gr_che$url_VK[x_club])
+
+x_club <- grep("public", gr_che$url_VK)
+gr_che$url_VK[x_club] <- gsub("public", "", gr_che$url_VK[x_club])
+```
+
+
+# 3 Выгрузка данных из ВК
+
+## 3.1 Устанавливаем соединение и создаем необходимые функции
+Для получения списка подписчиков групп используем метод [groups.getMembers]<https://vk.com/dev/groups.getMembers> из [API VK]<https://vk.com/dev/methods>
+```{r}
+# базовый url для работы с API VK
+url <- "https://api.vk.com/method/groups.getMembers?group_id=" 
+```
+
+Функция, которая возвращает количество участников группы
+```{r}
+get_count_memb <- function(id) {
+  url_get <- paste0(url, id) # Составляем запрос к API
+  resp <- getURL(url_get) # Запрашиваем и получаем ответ
+  Sys.sleep(0.34) # Задержка для обхода ограничения на кол-во запросов в сек
+  # Обрабатываем ответ и получаем id подписок
+  fromJSON(resp)$response$count
+}
+```
+
+Функция, которая возвращает список id участников группы
+```{r}
+get_id_memb <- function(group_URL) {
+  #url_get <- paste0(url, id) # Составляем запрос к API
+  resp <- getURL(group_URL) # Запрашиваем и получаем ответ
+  Sys.sleep(0.34) # Задержка для обхода ограничения на кол-во запросов в сек
+  # Обрабатываем ответ и получаем id подписок
+  fromJSON(resp)$response$users
+}
+```
+
+Теперь строим супер функцию, для возвращения id участников по списку групп (которая включает предыдущие две функции с небольшим изминением).
+
+Тут возникает несколько сложностей. 
+Так как за один запрос ВК возращает только тысячу участников необходимо делать несколько запросов и сохранять каждую тысячу из определенной группы в отдельный вектор, а потом сохранить все вектора в список.
+
+```{r}
+get_group_users <- function(group) {
+  url1 <- "https://api.vk.com/method/groups.getMembers?group_id="
+  print(paste0("Quering group ", group))
+  # Узнаем количество участников
+  resp <- getURL(paste0(url1, group)) # Составляем запрос к API
+  Sys.sleep(0.34) # Задержка для обхода ограничения на кол-во запросов в сек
+  group_members_count <- fromJSON(resp)$response$count
+  print(group_members_count)
+  
+  # Получаем ид участников
+  x <- character()
+  for(i in 0:floor(group_members_count/1000)){
+    print(paste0("Getting chunk ", i))
+    group_URL <- paste0(url1, group, "&offset=", 1000*i)
+    x <- append(x, get_id_memb(group_URL))
+  }
+  return(x)
+}
+```
+
+## 3.2 Выкачка данных (работа с API VK)
+Здесь несколько варинатов можно выполнить с помощью функций семейства `apply`, а можно использовать многопточность, что увеличит скорость. Когда у нас до 100 групп увеличение скорости не существенно, но если нам надо будет выгружать данные о каждом пользователе (более 100 тыс. пользователей), тогда примененеие многопточности просто незаменимо.
+
+###  3.2.1 Настраиваем многопоточность (делаем быстро)
+
+Для этого потребуется установка пакетов `foreach`, `doParallel`.
+
+```{r}
+library(foreach)
+library(doParallel)    
+```
+
+```{r}
+cl <- makeCluster(8)    # Создаем «кластер» на восемь потоков
+registerDoParallel(cl)
+
+#stopCluster(cl) # для того, чтобы остановить кластер, используем эту функцию
+```
+
+```{r}
+group_url <- gr_che$url_VK
+
+# получаем количество участников для каждой группы 
+## можно использовать system.time() для того, чтобы впечатляться скоростью
+system.time({
+  member_count_dopar <- foreach(j=1:length(group_url), .packages = c("RCurl", "jsonlite")) %dopar% get_count_memb(group_url[j]) # в функции foreach необходимо явно указать какие пакеты не из базовой сборки R используются в применяемой функции
+})
+
+# функция foreach возвращает элемент типа list, который следует перевести в вектор
+gr_che$group_size_VK_T2 <- unlist(member_count_dopar)
+
+# список участников групп для каждой группы
+system.time({
+  users <- foreach(j=1:length(group_url), .packages = c("RCurl", "jsonlite")) %dopar% get_group_users(group_url[j]) 
+})
+
+```
+
+Присваиваем имена элементам(векторам) списка
+```{r}
+names(users) <- gr_che$url_VK
+```
+
+```{r include= FALSE}
+all.users <- c(users, recursive = T)
+uniq.users <- unique(all.users)
+```
+Всего в группах, которые мы будем анализировать состоят `r length(uniq.users)` уникальных пользователей.
+
+Нас в первую очередь интересуют аудитория групп, которые реализуют проекты направленные на изменение городской среды. При помощи следующего кода находим аудиторию только таких групп.
+```{r}
+urban_users <- users[gr_che$url_VK[gr_che$physic_environment %in% 
+                                  c(4, 5) |
+                                    gr_che$urban_improve == 1]]
+all.urb_users <- c(urban_users, recursive = T)
+uniq.urb_users <- unique(all.urb_users)
+```
+
+Таким образом, по нашм данным в Челябинске уникальных пользователей, которые состоят в группах, посвященных изменениеям в городской среде или в группах, которые занимаются проектами по изменнию городской среды состоит `r length(uniq.urb_users)` человек.
+
+
+# 4 Создание файла для сетевого анализа
+
+
+## 4.1 Матрица пересечений аудиторий
+
+```{r}
+intersect.mat <- matrix(0, nrow = length(users), ncol = length(users))
+```
+
+## 4.2 Применение меры сходства Жаккара
+***нужно добавить формулу Жакара, описывающую вычисление пересечений среди групп используя Латех***
+
+
+Для этого применям следующую формулу
+```{r}
+common <- length(intersect(users[[i]], users[[j]]))
+all <- length(c(users[c(i,j)], recursive = T))
+kj = common/(all - common)
+```
+Где 
+
+## 4.3 Применение собственной меры сходства 
+
+```{r}
+for(i in 1:nrow(intersect.mat))
+  for(j in 1:ncol(intersect.mat))
+    intersect.mat[i, j] <- length(intersect(users[[i]], users[[j]]))/length(users[[i]])
+# диагональ должна быть равна 0
+diag(intersect.mat) <- 0
+```
+такая формула подсчитывает все возможные пересечения даже случайные. Ясно, что если в одной группе несколько тысяч человек и в другой тоже, то какая-то доля пересечений пользователей будет неинформативной. При этом такие слабые пересечения будут влиять на общий анализ взаимосвязей групп. В данном случае будет разумным считать несущественными слабые пересечений до определенного уровня и приравнять их к нулу. В нашем случае мы приходим к выводу, что доля ниже которой мы будем считать пересечния несущественными состаляет `r cut`.
+
+```{r}
+cut <- 0.05
+intersect.mat.cut <- apply(intersect.mat, 1, function(x){
+  x[x < cut] <- 0
+  x})
+```
+
+## 4.4 Созданием файла для построение графа и добавление параметров в данный файл
+
+Для начала создаем файл, который потом можно будет использовать для визуализации графа и собственно сетевого анализа. *(сетевой анализ мы будем осуществлять в программе Gephi)*
+```{r}
+int.graph <- graph_from_adjacency_matrix(intersect.mat.cut,
+                                         mode = "directed",
+                                         weighted = T)
+```
+
+Немного перобразуем наш дата фрейм. Сейчас у нас характеристки представлены в виде кодов (1, 2, 0...). Для понятности и необходимо отразить значения данных кодов.
+```{r}
+# параметры отражающие участие в конкурсах на гранты
+gr_che$grant_part <- ifelse(gr_che$grant_part %in% 1, "grant_part", "not_grant_part")
+gr_che$grant_win <- ifelse(gr_che$grant_win %in% 1, "grant_win", "not_grant_win")
+
+# имеет ли статус официального НКО или нет
+gr_che$is.NGO <- ifelse(gr_che$is.NGO %in% 1, "NGO", "not_NGO")
+
+# созданы ли проекты или НКО органами валасти. 
+gr_che$gov <- ifelse(gr_che$gov %in% 1, "gov", "not_gov")
+
+# цели в сфере изменнеия городской физической среды
+gr_che$physic_environment <- as.factor(gr_che$physic_environment)
+levels(gr_che$physic_environment) <- c("not", "prob_not", "prob_yes", "yes")
+
+# опыт в изменнеии городской физ среды
+gr_che$urban_improve <- ifelse(gr_che$urban_improve %in% 1, "urban_project", "urban_project")
+
+# протестная деятельность
+gr_che$revolt <- ifelse(gr_che$revolt %in% 1, "revolt", "not_revolt")
+
+gr_che$eco <- ifelse(gr_che$eco %in% 1, "eco", "not_eco")
+gr_che$commerce <- ifelse(gr_che$commerce %in% 1, "for_$", "not_for_$")
+```
+
+
+Теперь добавляем параметры, которые будем использовать для анализа графа. В данном исследовании нам нужные параметры, которые отражают направление деятельности активистских проектов или НКО, их опыт участия в гос грантах, являются ли они официально зарегистрированными или нет.
+
+```{r}
+# для удобства сохраняем необходимые характеристики в отдельные переменные
+is.NGO <- gr_che$is.NGO
+grant_win <- gr_che$grant_win
+grant_part <- gr_che$grant_part
+prof_eco <- gr_che$eco
+prof_commerce <- gr_che$commerce
+prof_physic_target <- as.character(gr_che$physic_environment)
+prof_urban_project <- gr_che$urban_improve
+prof_gov <- as.character(gr_che$gov)
+prof_revolt <- gr_che$revolt
+```
+
+Назначаем необходимые параметры узлов в файл с данными для построения графа.
+```{r}
+int.graph <- set_vertex_attr(int.graph, "group_size", value = unlist(member_count_dopar))
+int.graph <- set_vertex_attr(int.graph, "gov", value = prof_gov)
+int.graph <- set_vertex_attr(int.graph, "urban_project", value = prof_urban_project)
+int.graph <- set_vertex_attr(int.graph, "grant_win", value = grant_win)
+int.graph <- set_vertex_attr(int.graph, "grant_part", value = grant_part)
+int.graph <- set_vertex_attr(int.graph, "physic_target", value = prof_physic_target)
+int.graph <- set_vertex_attr(int.graph, "revolt", value = prof_revolt)
+int.graph <- set_vertex_attr(int.graph, "eco", value = prof_eco)
+int.graph <- set_vertex_attr(int.graph, "commerce", value = prof_commerce)
+int.graph <- set_vertex_attr(int.graph, "lable_NGO", value = gr_che$short_name)
+int.graph <- set_vertex_attr(int.graph, "is_NGO", value = is.NGO)
+
+```
+
+Сохраняем файл с данным для сетеовго анализа, который потом можно будет загрузить и использовать в *Gephi*.
+
+```{r}
+write_graph(int.graph, "Челябинск/che_graph_0.5.graphml", format = "graphml")
+```
